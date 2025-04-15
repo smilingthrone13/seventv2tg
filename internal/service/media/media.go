@@ -35,33 +35,25 @@ type Converter struct {
 func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, err error) {
 	const errMsg = "Converter.ConvertToTelegramVideo"
 
-	const (
-		resFileExt = "webm"
-		frameMask  = "frame_%03d.png"
-	)
+	const frameMask = "frame_%03d.png"
 
 	jobID := uuid.NewString()
 
 	defer func() {
-		err = os.RemoveAll(filepath.Join(m.jobsDir, jobID))
-		if err != nil {
-			slog.Error(
-				"Failed to remove job folder",
-				slog.String("jobID", jobID),
-				slog.Any("err", err),
-			)
+		errFs := os.RemoveAll(filepath.Join(m.jobsDir, jobID))
+		if errFs != nil {
+			slog.Error("Failed to remove job folder", slog.String("jobID", jobID), slog.Any("err", err))
 		}
 	}()
 
 	framesDirPath := filepath.Join(m.jobsDir, jobID, "frames")
-	resFilePath := filepath.Join(m.resDir, jobID+"."+resFileExt)
 
 	err = os.RemoveAll(framesDirPath)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	bitrate, err := m.getInputFramerate(inpFilePath)
+	framerate, err := m.getInputFramerate(inpFilePath)
 
 	err = os.MkdirAll(framesDirPath, os.ModePerm)
 	if err != nil {
@@ -73,12 +65,14 @@ func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, 
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	err = m.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resFilePath, bitrate)
+	resPath = filepath.Join(m.resDir, jobID+".webm")
+
+	err = m.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resPath, framerate)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	return resFilePath, nil
+	return resPath, nil
 }
 
 func (m *Converter) createSequence(inpPath, outPath string) error {
@@ -89,12 +83,8 @@ func (m *Converter) createSequence(inpPath, outPath string) error {
 		"+repage",
 		outPath,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
-
-	return errors.Wrap(err, "createSequence")
+	return errors.Wrap(cmd.Run(), "createSequence")
 }
 
 func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate int) error {
@@ -119,7 +109,6 @@ func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate i
 		}
 
 		bitrate, framerate, err = m.downscaleVideoParameters(bitrate, framerate)
-		fmt.Printf("lowering quality to %d bitrate, %d fps\n", bitrate, framerate)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
@@ -172,16 +161,12 @@ func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
 		"-an",
-		"-threads", "2",
+		"-threads", "1",
 		"-t", "3", // TODO: подогнать видео под максимальную длительность?
 		outPath,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
-
-	return errors.Wrap(err, errMessage)
+	return errors.Wrap(cmd.Run(), errMessage)
 }
 
 func (m *Converter) getInputFramerate(path string) (int, error) {

@@ -4,22 +4,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
 
-const maxDownloadSize = 15 << 20 // 15 MB
+const (
+	maxDownloadSize = 10 << 20
+	defaultTimeout  = time.Second * 10
+)
 
-func NewAPI(saveDir string) *API {
-	client := &http.Client{
-		Timeout: time.Second * 10,
-	}
+func New(saveDir string) *API {
+	client := &http.Client{Timeout: defaultTimeout}
 
 	return &API{
 		saveDir: saveDir,
@@ -32,22 +31,10 @@ type API struct {
 	client  *http.Client
 }
 
-func (a *API) DownloadWebp(emoteUrl string) (string, error) {
+func (a *API) DownloadWebp(emoteID string) (string, error) {
 	const errMsg = "SevenTvAPI.DownloadWebp"
 
-	u, err := url.ParseRequestURI(emoteUrl)
-	if err != nil {
-		return "", errors.Wrap(err, errMsg)
-	}
-
-	parts := strings.Split(strings.TrimLeft(u.Path, "/"), "/")
-	if len(parts) != 2 {
-		err = errors.New("invalid emote url")
-
-		return "", errors.Wrap(err, errMsg)
-	}
-
-	cdnUrl := fmt.Sprintf("https://cdn.7tv.app/emote/%s/4x.webp", parts[1])
+	cdnUrl := fmt.Sprintf("https://cdn.7tv.app/emote/%s/4x.webp", emoteID)
 
 	resp, err := a.client.Get(cdnUrl)
 	if err != nil {
@@ -84,7 +71,7 @@ func (a *API) DownloadWebp(emoteUrl string) (string, error) {
 
 	if written > maxDownloadSize {
 		_ = os.Remove(outPath)
-		err = errors.New("input file too large (>15MB)")
+		err = fmt.Errorf("input file too large (>%dMB)", maxDownloadSize>>20)
 
 		return "", errors.Wrap(err, errMsg)
 	}
