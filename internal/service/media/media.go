@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	defaultBitRate = 250
-	maxFrameRate   = 30
-	maxResultSize  = 256 << 10
+	defaultBitRate   = 250
+	overlayedBitRate = defaultBitRate + 150 // since we'll have more details we might also increase bitrate
+	maxFrameRate     = 30
+	maxResultSize    = 256 << 10
 )
 
 func NewMediaConverter(jobsDir, resDir string) *Converter {
@@ -72,6 +73,7 @@ func (m *Converter) ConvertToVideo(inpFilePath string) (resPath string, err erro
 
 	err = m.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resPath, framerate)
 	if err != nil {
+		_ = os.Remove(resPath)
 		return "", errors.Wrap(err, errMsg)
 	}
 
@@ -84,8 +86,9 @@ func (m *Converter) OverlayVideos(inpVideosPaths []string) (resPath string, err 
 	jobID := uuid.NewString()
 	resPath = filepath.Join(m.resDir, jobID+".webm")
 
-	err = m.mergeVideos(inpVideosPaths, resPath)
+	err = m.overlayVideos(inpVideosPaths, resPath)
 	if err != nil {
+		_ = os.Remove(resPath)
 		return "", errors.Wrap(err, errMsg)
 	}
 
@@ -100,6 +103,7 @@ func (m *Converter) createSequence(inpPath, outPath string) error {
 		"+repage",
 		outPath,
 	)
+	cmd.Stderr = os.Stderr
 
 	return errors.Wrap(cmd.Run(), "createSequence")
 }
@@ -178,16 +182,17 @@ func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
 		"-an",
-		"-threads", "1", // TODO: в конфиг
+		"-threads", "3", // TODO: в конфиг
 		"-t", "3",
 		outPath,
 	)
+	cmd.Stderr = os.Stderr
 
 	return errors.Wrap(cmd.Run(), errMessage)
 }
 
-func (m *Converter) mergeVideos(inpPaths []string, outPath string) error {
-	const errMessage = "mergeVideos"
+func (m *Converter) overlayVideos(inpPaths []string, outPath string) error {
+	const errMessage = "overlayVideos"
 
 	if len(inpPaths) < 2 {
 		return errors.Wrap(errors.New("not enough videos to merge"), errMessage)
@@ -201,7 +206,7 @@ func (m *Converter) mergeVideos(inpPaths []string, outPath string) error {
 	}
 
 	mergeString := strings.Builder{}
-	var currLayer, prevLayer string
+	prevLayer := "0"
 
 	for i := 1; i < len(inpPaths); i++ {
 		inpArgs := []string{
@@ -212,19 +217,12 @@ func (m *Converter) mergeVideos(inpPaths []string, outPath string) error {
 
 		args = append(args, inpArgs...)
 
-		currLayer = fmt.Sprintf("tmp%d", i)
+		currLayer := fmt.Sprintf("tmp%d", i)
 
-		var filterStr string
-		switch i {
-		case 1:
-			filterStr = fmt.Sprintf("[%d][%d] overlay=shortest=1 [%s]; ", 0, i, currLayer)
-		case len(inpPaths) - 1:
-			filterStr = fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i)
-		default:
-			filterStr = fmt.Sprintf("[%s][%d] overlay=shortest=1 [%s]; ", prevLayer, i, currLayer)
+		mergeString.WriteString(fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i))
+		if i != len(inpPaths)-1 {
+			mergeString.WriteString(" [" + currLayer + "]; ")
 		}
-
-		mergeString.WriteString(filterStr)
 
 		prevLayer = currLayer
 	}
@@ -233,10 +231,14 @@ func (m *Converter) mergeVideos(inpPaths []string, outPath string) error {
 		args,
 		"-lavfi", mergeString.String(),
 		"-c:v", "libvpx-vp9",
+		"-an",
+		"-threads", "3",
+		"-b:v", fmt.Sprintf("%dK", overlayedBitRate),
 		outPath,
 	)
 
 	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr
 
 	return errors.Wrap(cmd.Run(), errMessage)
 }

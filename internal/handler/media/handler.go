@@ -11,6 +11,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 
 	"seventv2tg/internal/config"
 	"seventv2tg/internal/domain"
@@ -93,7 +94,7 @@ func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Me
 			"MediaHandler.CreateVideoFromEmote",
 			slog.Int64("chatID", req.ChatID),
 			slog.Any("emoteIDs", req.EmoteIDs),
-			slog.Any("err", err),
+			slog.Any("err", err.Error()),
 		)
 	}
 }
@@ -176,12 +177,11 @@ func (h *Handler) processSingleEmote(chatID int64, replyToMessageID int, emoteID
 func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emoteIDs []string) error {
 	const errMsg = "processOverlayedEmote"
 
-	var (
-		err         error
-		emotePaths  []domain.EmotePaths
-		webmPaths   []string
-		resFilePath string
-	)
+	var err error
+	var resFilePath string
+
+	emotePaths := make([]domain.EmotePaths, len(emoteIDs))
+	webmPaths := make([]string, len(emoteIDs))
 
 	defer func() {
 		_ = os.RemoveAll(resFilePath)
@@ -191,20 +191,27 @@ func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emot
 		}
 	}()
 
-	for i, id := range emoteIDs {
-		emotePaths = append(emotePaths, domain.EmotePaths{})
+	eg := errgroup.Group{}
+	for i := range emoteIDs {
+		eg.Go(func() error {
+			emotePaths[i].Webp, err = h.apis.SevenTV.DownloadWebp(emoteIDs[i])
+			if err != nil {
+				return err
+			}
 
-		emotePaths[i].Webp, err = h.apis.SevenTV.DownloadWebp(id)
-		if err != nil {
-			return errors.Wrap(err, errMsg)
-		}
+			emotePaths[i].Webm, err = h.services.Media.ConvertToVideo(emotePaths[i].Webp)
+			if err != nil {
+				return err
+			}
 
-		emotePaths[i].Webm, err = h.services.Media.ConvertToVideo(emotePaths[i].Webp)
-		if err != nil {
-			return errors.Wrap(err, errMsg)
-		}
+			webmPaths[i] = emotePaths[i].Webm
 
-		webmPaths = append(webmPaths, emotePaths[i].Webm)
+			return nil
+		})
+	}
+
+	if err = eg.Wait(); err != nil {
+		return errors.Wrap(err, errMsg)
 	}
 
 	resFilePath, err = h.services.Media.OverlayVideos(webmPaths)
