@@ -11,3 +11,8 @@ type EmotePaths struct {
 	Webp string
 	Webm string
 }
+
+type SequenceInput struct {
+	Path      string
+	Framerate int
+}

@@ -180,33 +180,21 @@ func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emot
 	var err error
 	var resFilePath string
 
-	emotePaths := make([]domain.EmotePaths, len(emoteIDs))
-	webmPaths := make([]string, len(emoteIDs))
+	webpPaths := make([]string, len(emoteIDs))
 
 	defer func() {
 		_ = os.RemoveAll(resFilePath)
-		for i := range emotePaths {
-			_ = os.RemoveAll(emotePaths[i].Webp)
-			_ = os.RemoveAll(emotePaths[i].Webm)
+		for i := range webpPaths {
+			_ = os.RemoveAll(webpPaths[i])
 		}
 	}()
 
 	eg := errgroup.Group{}
 	for i := range emoteIDs {
 		eg.Go(func() error {
-			emotePaths[i].Webp, err = h.apis.SevenTV.DownloadWebp(emoteIDs[i])
-			if err != nil {
-				return err
-			}
+			webpPaths[i], err = h.apis.SevenTV.DownloadWebp(emoteIDs[i])
 
-			emotePaths[i].Webm, err = h.services.Media.ConvertToVideo(emotePaths[i].Webp)
-			if err != nil {
-				return err
-			}
-
-			webmPaths[i] = emotePaths[i].Webm
-
-			return nil
+			return err
 		})
 	}
 
@@ -214,7 +202,7 @@ func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emot
 		return errors.Wrap(err, errMsg)
 	}
 
-	resFilePath, err = h.services.Media.OverlayVideos(webmPaths)
+	resFilePath, err = h.services.Media.OverlayVideos(webpPaths)
 	if err != nil {
 		return errors.Wrap(err, errMsg)
 	}

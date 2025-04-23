@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"seventv2tg/internal/domain"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ const (
 	overlayedBitRate = defaultBitRate + 150 // since we'll have more details we might also increase bitrate
 	maxFrameRate     = 30
 	maxResultSize    = 256 << 10
+	frameMask        = "frame_%03d.png"
 )
 
 func NewMediaConverter(jobsDir, resDir string) *Converter {
@@ -36,8 +38,6 @@ type Converter struct {
 func (m *Converter) ConvertToVideo(inpFilePath string) (resPath string, err error) {
 	const errMsg = "Converter.ConvertToVideo"
 
-	const frameMask = "frame_%03d.png"
-
 	jobID := uuid.NewString()
 
 	defer func() {
@@ -48,11 +48,6 @@ func (m *Converter) ConvertToVideo(inpFilePath string) (resPath string, err erro
 	}()
 
 	framesDirPath := filepath.Join(m.jobsDir, jobID, "frames")
-
-	err = os.RemoveAll(framesDirPath)
-	if err != nil {
-		return "", errors.Wrap(err, errMsg)
-	}
 
 	err = os.MkdirAll(framesDirPath, os.ModePerm)
 	if err != nil {
@@ -80,13 +75,48 @@ func (m *Converter) ConvertToVideo(inpFilePath string) (resPath string, err erro
 	return resPath, nil
 }
 
-func (m *Converter) OverlayVideos(inpVideosPaths []string) (resPath string, err error) {
+func (m *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err error) {
 	const errMsg = "Converter.OverlayVideos"
 
 	jobID := uuid.NewString()
 	resPath = filepath.Join(m.resDir, jobID+".webm")
 
-	err = m.overlayVideos(inpVideosPaths, resPath)
+	defer func() {
+		errFs := os.RemoveAll(filepath.Join(m.jobsDir, jobID))
+		if errFs != nil {
+			slog.Error("Failed to remove job folder", slog.String("jobID", jobID), slog.Any("err", err))
+		}
+	}()
+
+	var sequences []domain.SequenceInput
+
+	for i := range inpFilePaths {
+		framesDirPath := filepath.Join(m.jobsDir, jobID, "frames")
+
+		err = os.MkdirAll(framesDirPath, os.ModePerm)
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		framerate, err := m.getInputFramerate(inpFilePaths[i])
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		seqPath := filepath.Join(framesDirPath, frameMask)
+
+		err = m.createSequence(inpFilePaths[i], seqPath)
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		sequences = append(sequences, domain.SequenceInput{
+			Path:      seqPath,
+			Framerate: framerate,
+		})
+	}
+
+	err = m.createOverlayedVideoFromSequences(sequences, resPath)
 	if err != nil {
 		_ = os.Remove(resPath)
 		return "", errors.Wrap(err, errMsg)
@@ -114,8 +144,13 @@ func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate i
 
 	bitrate := defaultBitRate
 
+	inp := domain.SequenceInput{
+		Path:      inpPath,
+		Framerate: framerate,
+	}
+
 	for {
-		err = m.assembleSequence(inpPath, outPath, framerate, bitrate)
+		err = m.assembleSequence(inp, outPath, bitrate)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
@@ -129,55 +164,66 @@ func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate i
 			return nil
 		}
 
-		bitrate, framerate, err = m.downscaleVideoParameters(bitrate, framerate)
+		bitrate, err = m.downscaleVideoParameters(bitrate)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
 	}
 }
 
-func (m *Converter) downscaleVideoParameters(bitrate, framerate int) (newBitrate, newFramerate int, err error) {
+func (m *Converter) createOverlayedVideoFromSequences(inputs []domain.SequenceInput, outPath string) error {
+	const errMessage = "createOverlayedVideoFromSequences"
+	var err error
+
+	bitrate := defaultBitRate
+
+	for {
+		err = m.assembleSequences(inputs, outPath, bitrate)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+
+		fInfo, err := os.Stat(outPath)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+
+		if fInfo.Size() <= maxResultSize {
+			return nil
+		}
+
+		bitrate, err = m.downscaleVideoParameters(bitrate)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+	}
+}
+
+func (m *Converter) downscaleVideoParameters(bitrate int) (newBitrate int, err error) {
 	const errMessage = "downscaleVideoParameters"
 	const (
-		bitrateFirstThreshold    = 150
-		bitrateSecondThreshold   = 100
-		framerateFirstThreshold  = 25
-		framerateSecondThreshold = 20
-
-		bitrateDropRate   = 20
-		framerateDropRate = 2
+		bitrateThreshold = 150
+		bitrateDropRate  = 20
 	)
 
-	if bitrate >= bitrateFirstThreshold {
-		return bitrate - bitrateDropRate, framerate, nil
-	}
-
-	if framerate >= framerateFirstThreshold {
-		return framerate, framerate - framerateDropRate, nil
-	}
-
-	if bitrate >= bitrateSecondThreshold {
-		return bitrate - bitrateDropRate, framerate, nil
-	}
-
-	if framerate >= framerateSecondThreshold {
-		return framerate, framerate - framerateDropRate, nil
+	if bitrate > bitrateThreshold {
+		return bitrate - bitrateDropRate, nil
 	}
 
 	err = errors.New("lower quality limit exceeded")
 
-	return 0, 0, errors.Wrap(err, errMessage)
+	return 0, errors.Wrap(err, errMessage)
 }
 
-func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate int) error {
+func (m *Converter) assembleSequence(inp domain.SequenceInput, outPath string, bitrate int) error {
 	const errMessage = "assembleSequence"
 
 	cmd := exec.Command(
 		"ffmpeg",
 		"-y",
 		"-loglevel", "error",
-		"-framerate", fmt.Sprintf("%d", framerate),
-		"-i", inpPath,
+		"-framerate", fmt.Sprintf("%d", inp.Framerate),
+		"-i", inp.Path,
 		"-vf", "scale='if(gte(iw,ih),512,-1)':'if(gte(ih,iw),512,-1)',format=yuva420p,loop=0",
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
@@ -191,51 +237,108 @@ func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 	return errors.Wrap(cmd.Run(), errMessage)
 }
 
-func (m *Converter) overlayVideos(inpPaths []string, outPath string) error {
-	const errMessage = "overlayVideos"
+func (m *Converter) assembleSequences(inputs []domain.SequenceInput, outPath string, bitrate int) error {
+	const errMessage = "assembleSequences"
 
-	if len(inpPaths) < 2 {
+	if len(inputs) < 2 {
 		return errors.Wrap(errors.New("not enough videos to merge"), errMessage)
 	}
 
 	args := []string{
 		"-y",
 		"-loglevel", "error",
-		"-i", inpPaths[0],
-		"-c:v", "libvpx-vp9",
+		"-framerate", fmt.Sprintf("%d", inputs[0].Framerate),
+		"-i", inputs[0].Path,
 	}
 
-	mergeString := strings.Builder{}
-	prevLayer := "0"
+	scaleString := strings.Builder{}
+	overlayString := strings.Builder{}
 
-	for i := 1; i < len(inpPaths); i++ {
+	for i := 1; i < len(inputs); i++ {
 		inpArgs := []string{
 			"-stream_loop", "-1",
-			"-i", inpPaths[i],
-			"-c:v", "libvpx-vp9",
+			"-framerate", fmt.Sprintf("%d", inputs[i].Framerate),
+			"-i", inputs[i].Path,
 		}
 
 		args = append(args, inpArgs...)
+	}
 
-		currLayer := fmt.Sprintf("tmp%d", i)
+	for i := 0; i < len(inputs); i++ {
+		currScaleLayer := fmt.Sprintf("scale%d", i)
+		nextScaleLayer := fmt.Sprintf("scale%d", i+1)
 
-		mergeString.WriteString(fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i))
-		if i != len(inpPaths)-1 {
-			mergeString.WriteString(" [" + currLayer + "]; ")
+		scaleStr := fmt.Sprintf(
+			"[%d:v] scale='if(gte(iw,ih),512,-1)':'if(gte(ih,iw),512,-1)',format=yuva420p,loop=0 [%s]; ",
+			i, currScaleLayer,
+		)
+
+		scaleString.WriteString(scaleStr)
+
+		currOverlayLayer := fmt.Sprintf("overlay%d", i)
+		prevOverlayLayer := fmt.Sprintf("overlay%d", i-1)
+		var overlayStr string
+
+		switch i {
+		case 0:
+			overlayStr = fmt.Sprintf(
+				"[%s][%s] overlay=shortest=1 [%s]; ",
+				currScaleLayer, nextScaleLayer, currOverlayLayer,
+			)
+		case len(inputs) - 1:
+			overlayStr = fmt.Sprintf(
+				"[%s][%s] overlay=shortest=1",
+				prevOverlayLayer, currScaleLayer,
+			)
+		default:
+			overlayStr = fmt.Sprintf(
+				"[%s][%s] overlay=shortest=1 [%s]; ",
+				prevOverlayLayer, currScaleLayer, currOverlayLayer,
+			)
 		}
 
-		prevLayer = currLayer
+		overlayString.WriteString(overlayStr)
 	}
 
 	args = append(
 		args,
-		"-lavfi", mergeString.String(),
+		"-filter_complex", scaleString.String()+overlayString.String(),
 		"-c:v", "libvpx-vp9",
 		"-an",
-		"-threads", "3",
 		"-b:v", fmt.Sprintf("%dK", overlayedBitRate),
+		"-t", "3",
+		"-threads", "3",
 		outPath,
 	)
+
+	//for i := 1; i < len(inpPaths); i++ {
+	//	inpArgs := []string{
+	//		"-stream_loop", "-1",
+	//		"-i", inpPaths[i],
+	//		"-c:v", "libvpx-vp9",
+	//	}
+	//
+	//	args = append(args, inpArgs...)
+	//
+	//	currLayer := fmt.Sprintf("tmp%d", i)
+	//
+	//	mergeString.WriteString(fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i))
+	//	if i != len(inpPaths)-1 {
+	//		mergeString.WriteString(" [" + currLayer + "]; ")
+	//	}
+	//
+	//	prevLayer = currLayer
+	//}
+	//
+	//args = append(
+	//	args,
+	//	"-lavfi", mergeString.String(),
+	//	"-c:v", "libvpx-vp9",
+	//	"-an",
+	//	"-threads", "3",
+	//	"-b:v", fmt.Sprintf("%dK", overlayedBitRate),
+	//	outPath,
+	//)
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.Stderr = os.Stderr
