@@ -3,6 +3,11 @@ package domain
 type UserRequest struct {
 	ChatID           int64
 	ReplyToMessageID int
-	EmoteID          string
+	EmoteIDs         []string
 	ErrChan          chan error
+}
+
+type EmotePaths struct {
+	Webp string
+	Webm string
 }

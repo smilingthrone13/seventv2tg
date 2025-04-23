@@ -32,8 +32,8 @@ type Converter struct {
 	resDir  string
 }
 
-func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, err error) {
-	const errMsg = "Converter.ConvertToTelegramVideo"
+func (m *Converter) ConvertToVideo(inpFilePath string) (resPath string, err error) {
+	const errMsg = "Converter.ConvertToVideo"
 
 	const frameMask = "frame_%03d.png"
 
@@ -53,9 +53,12 @@ func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, 
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	framerate, err := m.getInputFramerate(inpFilePath)
-
 	err = os.MkdirAll(framesDirPath, os.ModePerm)
+	if err != nil {
+		return "", errors.Wrap(err, errMsg)
+	}
+
+	framerate, err := m.getInputFramerate(inpFilePath)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
@@ -68,6 +71,20 @@ func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, 
 	resPath = filepath.Join(m.resDir, jobID+".webm")
 
 	err = m.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resPath, framerate)
+	if err != nil {
+		return "", errors.Wrap(err, errMsg)
+	}
+
+	return resPath, nil
+}
+
+func (m *Converter) OverlayVideos(inpVideosPaths []string) (resPath string, err error) {
+	const errMsg = "Converter.OverlayVideos"
+
+	jobID := uuid.NewString()
+	resPath = filepath.Join(m.resDir, jobID+".webm")
+
+	err = m.mergeVideos(inpVideosPaths, resPath)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
@@ -161,10 +178,65 @@ func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
 		"-an",
-		"-threads", "1",
-		"-t", "3", // TODO: подогнать видео под максимальную длительность?
+		"-threads", "1", // TODO: в конфиг
+		"-t", "3",
 		outPath,
 	)
+
+	return errors.Wrap(cmd.Run(), errMessage)
+}
+
+func (m *Converter) mergeVideos(inpPaths []string, outPath string) error {
+	const errMessage = "mergeVideos"
+
+	if len(inpPaths) < 2 {
+		return errors.Wrap(errors.New("not enough videos to merge"), errMessage)
+	}
+
+	args := []string{
+		"-y",
+		"-loglevel", "error",
+		"-i", inpPaths[0],
+		"-c:v", "libvpx-vp9",
+	}
+
+	mergeString := strings.Builder{}
+	var currLayer, prevLayer string
+
+	for i := 1; i < len(inpPaths); i++ {
+		inpArgs := []string{
+			"-stream_loop", "-1",
+			"-i", inpPaths[i],
+			"-c:v", "libvpx-vp9",
+		}
+
+		args = append(args, inpArgs...)
+
+		currLayer = fmt.Sprintf("tmp%d", i)
+
+		var filterStr string
+		switch i {
+		case 1:
+			filterStr = fmt.Sprintf("[%d][%d] overlay=shortest=1 [%s]; ", 0, i, currLayer)
+		case len(inpPaths) - 1:
+			filterStr = fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i)
+		default:
+			filterStr = fmt.Sprintf("[%s][%d] overlay=shortest=1 [%s]; ", prevLayer, i, currLayer)
+		}
+
+		mergeString.WriteString(filterStr)
+
+		prevLayer = currLayer
+	}
+
+	args = append(
+		args,
+		"-lavfi", mergeString.String(),
+		"-c:v", "libvpx-vp9",
+		outPath,
+	)
+
+	cmd := exec.Command("ffmpeg", args...)
 
 	return errors.Wrap(cmd.Run(), errMessage)
 }
