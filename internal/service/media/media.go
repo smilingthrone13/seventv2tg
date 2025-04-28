@@ -1,6 +1,7 @@
 package media
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -15,9 +16,26 @@ import (
 )
 
 const (
-	defaultBitRate = 250
-	maxFrameRate   = 30
-	maxResultSize  = 256 << 10
+	defaultFramerate = 30
+	defaultBitRate   = 250
+	overlayedBitRate = defaultBitRate + 150 // since we'll have more details we might also increase bitrate
+
+	maxResultSize = 256 << 10
+
+	frameMask = "frame_%03d.png"
+
+	autoHeight = 0
+	autoWidth  = 0
+)
+
+type (
+	videoStream struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+	ffprobeOutput struct {
+		Streams []videoStream `json:"streams"`
+	}
 )
 
 func NewMediaConverter(jobsDir, resDir string) *Converter {
@@ -32,50 +50,111 @@ type Converter struct {
 	resDir  string
 }
 
-func (m *Converter) ConvertToTelegramVideo(inpFilePath string) (resPath string, err error) {
-	const errMsg = "Converter.ConvertToTelegramVideo"
-
-	const frameMask = "frame_%03d.png"
+func (c *Converter) ConvertToVideo(inpFilePath string) (resPath string, err error) {
+	const errMsg = "Converter.ConvertToVideo"
 
 	jobID := uuid.NewString()
 
 	defer func() {
-		errFs := os.RemoveAll(filepath.Join(m.jobsDir, jobID))
+		errFs := os.RemoveAll(filepath.Join(c.jobsDir, jobID))
 		if errFs != nil {
 			slog.Error("Failed to remove job folder", slog.String("jobID", jobID), slog.Any("err", err))
 		}
 	}()
 
-	framesDirPath := filepath.Join(m.jobsDir, jobID, "frames")
-
-	err = os.RemoveAll(framesDirPath)
-	if err != nil {
-		return "", errors.Wrap(err, errMsg)
-	}
-
-	framerate, err := m.getInputFramerate(inpFilePath)
+	framesDirPath := filepath.Join(c.jobsDir, jobID, "frames")
 
 	err = os.MkdirAll(framesDirPath, os.ModePerm)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	err = m.createSequence(inpFilePath, filepath.Join(framesDirPath, frameMask))
+	framerate, err := c.getVideoFramerate(inpFilePath)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	resPath = filepath.Join(m.resDir, jobID+".webm")
-
-	err = m.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resPath, framerate)
+	err = c.createSequence(inpFilePath, filepath.Join(framesDirPath, frameMask))
 	if err != nil {
+		return "", errors.Wrap(err, errMsg)
+	}
+
+	resPath = filepath.Join(c.resDir, jobID+".webm")
+
+	err = c.createVideoFromSequence(filepath.Join(framesDirPath, frameMask), resPath, framerate, autoHeight, autoWidth)
+	if err != nil {
+		_ = os.Remove(resPath)
 		return "", errors.Wrap(err, errMsg)
 	}
 
 	return resPath, nil
 }
 
-func (m *Converter) createSequence(inpPath, outPath string) error {
+func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err error) {
+	const errMsg = "Converter.OverlayVideos"
+
+	jobID := uuid.NewString()
+	resPath = filepath.Join(c.resDir, jobID+".webm")
+
+	defer func() {
+		errFs := os.RemoveAll(filepath.Join(c.jobsDir, jobID))
+		if errFs != nil {
+			slog.Error("Failed to remove job folder", slog.String("jobID", jobID), slog.Any("err", err))
+		}
+	}()
+
+	var layers []string
+
+	height, width := autoHeight, autoWidth
+
+	for i := range inpFilePaths {
+		framesDirPath := filepath.Join(c.jobsDir, jobID, fmt.Sprintf("frames-%d", i))
+
+		err = os.MkdirAll(framesDirPath, os.ModePerm)
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		seqPath := filepath.Join(framesDirPath, frameMask)
+
+		framerate, err := c.getVideoFramerate(inpFilePaths[i])
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		err = c.createSequence(inpFilePaths[i], seqPath)
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		webmPath := filepath.Join(c.jobsDir, jobID, fmt.Sprintf("layer-%d.webm", i))
+
+		err = c.createVideoFromSequence(seqPath, webmPath, framerate, width, height)
+		if err != nil {
+			return "", errors.Wrap(err, errMsg)
+		}
+
+		// use base layer dimensions as reference
+		if i == 0 {
+			width, height, err = c.getVideoDimensions(webmPath)
+			if err != nil {
+				return "", errors.Wrap(err, errMsg)
+			}
+		}
+
+		layers = append(layers, webmPath)
+	}
+
+	err = c.createOverlayedVideo(layers, resPath)
+	if err != nil {
+		_ = os.Remove(resPath)
+		return "", errors.Wrap(err, errMsg)
+	}
+
+	return resPath, nil
+}
+
+func (c *Converter) createSequence(inpPath, outPath string) error {
 	cmd := exec.Command(
 		"magick",
 		inpPath,
@@ -83,18 +162,19 @@ func (m *Converter) createSequence(inpPath, outPath string) error {
 		"+repage",
 		outPath,
 	)
+	cmd.Stderr = os.Stderr
 
 	return errors.Wrap(cmd.Run(), "createSequence")
 }
 
-func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate int) error {
+func (c *Converter) createVideoFromSequence(inpPath, outPath string, framerate, width, height int) error {
 	const errMessage = "createVideoFromSequence"
 	var err error
 
 	bitrate := defaultBitRate
 
 	for {
-		err = m.assembleSequence(inpPath, outPath, framerate, bitrate)
+		err = c.assembleSequence(inpPath, outPath, framerate, bitrate, width, height)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
@@ -108,48 +188,66 @@ func (m *Converter) createVideoFromSequence(inpPath, outPath string, framerate i
 			return nil
 		}
 
-		bitrate, framerate, err = m.downscaleVideoParameters(bitrate, framerate)
+		bitrate, err = c.downscaleVideoParameters(bitrate)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
 	}
 }
 
-func (m *Converter) downscaleVideoParameters(bitrate, framerate int) (newBitrate, newFramerate int, err error) {
+func (c *Converter) createOverlayedVideo(inpPaths []string, outPath string) error {
+	const errMessage = "createOverlayedVideo"
+	var err error
+
+	bitrate := overlayedBitRate
+
+	for {
+		err = c.assembleLayers(inpPaths, outPath, bitrate)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+
+		fInfo, err := os.Stat(outPath)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+
+		if fInfo.Size() <= maxResultSize {
+			return nil
+		}
+
+		bitrate, err = c.downscaleVideoParameters(bitrate)
+		if err != nil {
+			return errors.Wrap(err, errMessage)
+		}
+	}
+}
+
+func (c *Converter) downscaleVideoParameters(bitrate int) (newBitrate int, err error) {
 	const errMessage = "downscaleVideoParameters"
 	const (
-		bitrateFirstThreshold    = 150
-		bitrateSecondThreshold   = 100
-		framerateFirstThreshold  = 25
-		framerateSecondThreshold = 20
-
-		bitrateDropRate   = 20
-		framerateDropRate = 2
+		bitrateThreshold = 150
+		bitrateDropRate  = 20
 	)
 
-	if bitrate >= bitrateFirstThreshold {
-		return bitrate - bitrateDropRate, framerate, nil
-	}
-
-	if framerate >= framerateFirstThreshold {
-		return framerate, framerate - framerateDropRate, nil
-	}
-
-	if bitrate >= bitrateSecondThreshold {
-		return bitrate - bitrateDropRate, framerate, nil
-	}
-
-	if framerate >= framerateSecondThreshold {
-		return framerate, framerate - framerateDropRate, nil
+	if bitrate > bitrateThreshold {
+		return bitrate - bitrateDropRate, nil
 	}
 
 	err = errors.New("lower quality limit exceeded")
 
-	return 0, 0, errors.Wrap(err, errMessage)
+	return 0, errors.Wrap(err, errMessage)
 }
 
-func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate int) error {
+func (c *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate, width, height int) error {
 	const errMessage = "assembleSequence"
+
+	var scaleStr string
+	if height == autoHeight || width == autoWidth {
+		scaleStr = "'if(gte(iw,ih),512,-1)':'if(gte(ih,iw),512,-1)'"
+	} else {
+		scaleStr = fmt.Sprintf("%d:%d", width, height)
+	}
 
 	cmd := exec.Command(
 		"ffmpeg",
@@ -157,22 +255,109 @@ func (m *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 		"-loglevel", "error",
 		"-framerate", fmt.Sprintf("%d", framerate),
 		"-i", inpPath,
-		"-vf", "scale='if(gte(iw,ih),512,-1)':'if(gte(ih,iw),512,-1)',format=yuva420p,loop=0",
+		//"-vf", "scale="+scaleStr+",format=yuva420p,loop=0",
+		"-vf", "scale="+scaleStr+",format=yuva420p",
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
+		"-auto-alt-ref", "0",
 		"-an",
-		"-threads", "1",
-		"-t", "3", // TODO: подогнать видео под максимальную длительность?
+		"-threads", "3", // TODO: в конфиг
+		"-t", "3",
 		outPath,
 	)
+	cmd.Stderr = os.Stderr
 
 	return errors.Wrap(cmd.Run(), errMessage)
 }
 
-func (m *Converter) getInputFramerate(path string) (int, error) {
-	const errMessage = "getInputFramerate"
+func (c *Converter) assembleLayers(inpPaths []string, outPath string, bitrate int) error {
+	const errMessage = "assembleLayers"
 
-	cmd := exec.Command("magick", "identify", "-format", "%T\n", path)
+	if len(inpPaths) < 2 {
+		return errors.Wrap(errors.New("not enough videos to merge"), errMessage)
+	}
+
+	args := []string{
+		"-y",
+		"-loglevel", "error",
+		"-c:v", "libvpx-vp9",
+		"-i", inpPaths[0],
+	}
+
+	overlayString := strings.Builder{}
+	prevLayer := "0"
+
+	for i := 1; i < len(inpPaths); i++ {
+		inpArgs := []string{
+			"-stream_loop", "-1",
+			"-c:v", "libvpx-vp9",
+			"-i", inpPaths[i],
+		}
+
+		args = append(args, inpArgs...)
+
+		currLayer := fmt.Sprintf("tmp%d", i)
+
+		overlayString.WriteString(fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i))
+		if i != len(inpPaths)-1 {
+			overlayString.WriteString(" [" + currLayer + "]; ")
+		}
+
+		prevLayer = currLayer
+	}
+
+	args = append(
+		args,
+		"-filter_complex", overlayString.String(),
+		"-c:v", "libvpx-vp9",
+		"-pix_fmt", "yuva420p",
+		"-b:v", fmt.Sprintf("%dK", bitrate),
+		"-auto-alt-ref", "0",
+		"-an",
+		"-t", "3",
+		"-threads", "3", // TODO: в конфиг
+		outPath,
+	)
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr
+
+	return errors.Wrap(cmd.Run(), errMessage)
+}
+
+func (c *Converter) getVideoDimensions(inpPath string) (width, height int, err error) {
+	const errMessage = "getVideoDimensions"
+
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "json",
+		inpPath,
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, errors.Wrap(err, errMessage)
+	}
+
+	var probeOutput ffprobeOutput
+	if err = json.Unmarshal(output, &probeOutput); err != nil {
+		return 0, 0, errors.Wrap(err, errMessage)
+	}
+
+	if len(probeOutput.Streams) == 0 {
+		return 0, 0, errors.Wrap(errors.New("no video stream found"), errMessage)
+	}
+
+	return probeOutput.Streams[0].Width, probeOutput.Streams[0].Height, nil
+}
+
+func (m *Converter) getVideoFramerate(inpPath string) (int, error) {
+	const errMessage = "getVideoFramerate"
+
+	cmd := exec.Command("magick", "identify", "-format", "%T\n", inpPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, errors.Wrap(err, errMessage)
@@ -189,13 +374,11 @@ func (m *Converter) getInputFramerate(path string) (int, error) {
 	}
 
 	if totalTime == 0 || len(lines) == 0 {
-		err = errors.New("invalid animation timing")
-
-		return 0, errors.Wrap(err, errMessage)
+		return 1, nil
 	}
 
 	duration := float64(totalTime) / 100.0
 	fps := float64(len(lines)) / duration
 
-	return min(maxFrameRate, int(math.Round(fps))), nil
+	return min(defaultFramerate, max(int(math.Round(fps)), 10)), nil
 }

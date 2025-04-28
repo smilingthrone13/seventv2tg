@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -50,7 +50,7 @@ func (s *Server) Start() {
 
 	updatesChan := s.api.GetUpdatesChan()
 
-	fmt.Println("Server started!")
+	log.Println("Server started!")
 
 	for {
 		select {

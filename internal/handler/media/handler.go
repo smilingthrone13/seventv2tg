@@ -11,6 +11,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 
 	"seventv2tg/internal/config"
 	"seventv2tg/internal/domain"
@@ -19,6 +20,8 @@ import (
 )
 
 const workerCount = 3
+const emoteIdLength = 26
+const maxOverlayedEmotes = 3
 
 type Handler struct {
 	cfg      *config.Config
@@ -47,17 +50,24 @@ func New(cfg *config.Config, apis *webapi.WebAPIs, services *service.Services) *
 }
 
 func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Message) {
-	if _, hit := h.activityCache.Get(strconv.FormatInt(message.Chat.ID, 10)); hit {
+	if _, ok := h.activityCache.Get(strconv.FormatInt(message.Chat.ID, 10)); ok {
 		_, _ = h.apis.Bot.SendMessage(message.Chat.ID, "You have another emote being processed, please wait")
-
 		return
 	}
 
-	emoteID, err := h.validateUserInput(message.Text)
-	if err != nil {
-		_, _ = h.apis.Bot.SendMessage(message.Chat.ID, "Invalid emote URL")
+	userInput := strings.Fields(message.Text)
+	userInput = userInput[:min(len(userInput), maxOverlayedEmotes)]
 
-		return
+	var emoteIDs []string
+
+	for i := range userInput {
+		emoteID, err := h.validateUserInput(userInput[i])
+		if err != nil {
+			_, _ = h.apis.Bot.SendMessage(message.Chat.ID, "Invalid emote URL")
+			return
+		}
+
+		emoteIDs = append(emoteIDs, emoteID)
 	}
 
 	h.activityCache.Set(strconv.FormatInt(message.Chat.ID, 10), struct{}{}, cache.NoExpiration)
@@ -66,7 +76,7 @@ func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Me
 	req := domain.UserRequest{
 		ChatID:           message.Chat.ID,
 		ReplyToMessageID: message.MessageID,
-		EmoteID:          emoteID,
+		EmoteIDs:         emoteIDs,
 		ErrChan:          make(chan error),
 	}
 	h.reqQueue <- req
@@ -83,15 +93,21 @@ func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Me
 		slog.Error(
 			"MediaHandler.CreateVideoFromEmote",
 			slog.Int64("chatID", req.ChatID),
-			slog.String("emoteID", req.EmoteID),
-			slog.Any("err", err),
+			slog.Any("emoteIDs", req.EmoteIDs),
+			slog.Any("err", err.Error()),
 		)
 	}
 }
 
 func (h *Handler) mediaWorker() {
+	var err error
+
 	for req := range h.reqQueue {
-		err := h.processEmote(req.ChatID, req.ReplyToMessageID, req.EmoteID)
+		if len(req.EmoteIDs) > 1 {
+			err = h.processOverlayedEmote(req.ChatID, req.ReplyToMessageID, req.EmoteIDs)
+		} else {
+			err = h.processSingleEmote(req.ChatID, req.ReplyToMessageID, req.EmoteIDs[0])
+		}
 		if err != nil {
 			req.ErrChan <- err
 		}
@@ -105,8 +121,10 @@ func (h *Handler) validateUserInput(inp string) (emoteID string, err error) {
 		"MediaHandler.validateUserInput",
 	)
 
-	trimmed := strings.TrimPrefix(inp, "https://")
+	trimmed := strings.TrimSpace(inp)
+	trimmed = strings.TrimPrefix(trimmed, "https://")
 	trimmed = strings.TrimPrefix(trimmed, "www.")
+
 	if !strings.HasPrefix(trimmed, "7tv.app/emotes") {
 		return "", errMsg
 	}
@@ -117,35 +135,79 @@ func (h *Handler) validateUserInput(inp string) (emoteID string, err error) {
 	}
 
 	parts := strings.Split(strings.TrimLeft(u.Path, "/"), "/")
-	if len(parts) != 2 {
+	if len(parts) != 2 || len(parts[1]) != emoteIdLength {
 		return "", errMsg
 	}
 
 	return parts[1], nil
 }
 
-func (h *Handler) processEmote(chatID int64, replyToMessageID int, emoteID string) error {
-	const errMsg = "processEmote"
+func (h *Handler) processSingleEmote(chatID int64, replyToMessageID int, emoteID string) error {
+	const errMsg = "processSingleEmote"
 
 	var err error
-	var webpFilePath, webmFilePath string
+	var paths domain.EmotePaths
 
 	defer func() {
-		_ = os.RemoveAll(webpFilePath)
-		_ = os.RemoveAll(webmFilePath)
+		_ = os.RemoveAll(paths.Webp)
+		_ = os.RemoveAll(paths.Webm)
 	}()
 
-	webpFilePath, err = h.apis.SevenTV.DownloadWebp(emoteID)
+	paths.Webp, err = h.apis.SevenTV.DownloadWebp(emoteID)
 	if err != nil {
 		return errors.Wrap(err, errMsg)
 	}
 
-	webmFilePath, err = h.services.Media.ConvertToTelegramVideo(webpFilePath)
+	paths.Webm, err = h.services.Media.ConvertToVideo(paths.Webp)
 	if err != nil {
 		return errors.Wrap(err, errMsg)
 	}
 
-	attachment := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(webmFilePath))
+	attachment := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(paths.Webm))
+	attachment.ReplyToMessageID = replyToMessageID
+
+	err = h.apis.Bot.SendAttachment(attachment)
+	if err != nil {
+		return errors.Wrap(err, errMsg)
+	}
+
+	return nil
+}
+
+func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emoteIDs []string) error {
+	const errMsg = "processOverlayedEmote"
+
+	var err error
+	var resFilePath string
+
+	webpPaths := make([]string, len(emoteIDs))
+
+	defer func() {
+		_ = os.RemoveAll(resFilePath)
+		for i := range webpPaths {
+			_ = os.RemoveAll(webpPaths[i])
+		}
+	}()
+
+	eg := errgroup.Group{}
+	for i := range emoteIDs {
+		eg.Go(func() error {
+			webpPaths[i], err = h.apis.SevenTV.DownloadWebp(emoteIDs[i])
+
+			return err
+		})
+	}
+
+	if err = eg.Wait(); err != nil {
+		return errors.Wrap(err, errMsg)
+	}
+
+	resFilePath, err = h.services.Media.OverlayVideos(webpPaths)
+	if err != nil {
+		return errors.Wrap(err, errMsg)
+	}
+
+	attachment := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(resFilePath))
 	attachment.ReplyToMessageID = replyToMessageID
 
 	err = h.apis.Bot.SendAttachment(attachment)
