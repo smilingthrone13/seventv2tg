@@ -1,4 +1,4 @@
-# 7tv2tg stickers Telegram Bot
+# seventv2tg stickers Telegram Bot
 
 Попробуй [здесь](https://t.me/seventv_to_sticker_bot) <b>(Сейчас оффлайн!)</b><br>
 
