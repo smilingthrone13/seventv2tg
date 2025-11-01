@@ -7,13 +7,13 @@ import (
 )
 
 type WebAPIs struct {
-	Bot     *tgbot.API
+	TgBot   *tgbot.API
 	SevenTV *seventv.API
 }
 
 func New(cfg *config.Config) *WebAPIs {
 	return &WebAPIs{
-		Bot:     tgbot.New(cfg.Debug, cfg.BotApiKey),
+		TgBot:   tgbot.New(cfg.Debug, cfg.BotApiKey),
 		SevenTV: seventv.New(cfg.Paths.Input),
 	}
 }

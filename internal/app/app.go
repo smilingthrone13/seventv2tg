@@ -25,7 +25,7 @@ func New(cfg *config.Config) *App {
 	s := server.New(
 		&server.InitParams{
 			Config:   cfg,
-			Api:      webAPI.Bot,
+			Api:      webAPI.TgBot,
 			Handlers: handlers,
 		},
 	)

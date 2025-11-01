@@ -51,7 +51,7 @@ func New(cfg *config.Config, apis *webapi.WebAPIs, services *service.Services) *
 
 func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Message) {
 	if _, ok := h.activityCache.Get(strconv.FormatInt(message.Chat.ID, 10)); ok {
-		_, _ = h.apis.Bot.SendMessage(message.Chat.ID, "You have another emote being processed, please wait")
+		_, _ = h.apis.TgBot.SendMessage(message.Chat.ID, "You have another emote being processed, please wait")
 		return
 	}
 
@@ -63,7 +63,7 @@ func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Me
 	for i := range userInput {
 		emoteID, err := h.validateUserInput(userInput[i])
 		if err != nil {
-			_, _ = h.apis.Bot.SendMessage(message.Chat.ID, "Invalid emote URL")
+			_, _ = h.apis.TgBot.SendMessage(message.Chat.ID, "Invalid emote URL")
 			return
 		}
 
@@ -81,14 +81,14 @@ func (h *Handler) CreateVideoFromEmote(ctx context.Context, message *tgbotapi.Me
 	}
 	h.reqQueue <- req
 
-	msg, err := h.apis.Bot.SendMessage(req.ChatID, "Emote added to processing queue")
+	msg, err := h.apis.TgBot.SendMessage(req.ChatID, "Emote added to processing queue")
 	if err == nil {
-		defer h.apis.Bot.DeleteMessage(req.ChatID, msg.MessageID)
+		defer h.apis.TgBot.DeleteMessage(req.ChatID, msg.MessageID)
 	}
 
 	err = <-req.ErrChan
 	if err != nil {
-		_, _ = h.apis.Bot.SendMessage(req.ChatID, "Unknown error while processing emote")
+		_, _ = h.apis.TgBot.SendMessage(req.ChatID, "Unknown error while processing emote")
 
 		slog.Error(
 			"MediaHandler.CreateVideoFromEmote",
@@ -166,7 +166,7 @@ func (h *Handler) processSingleEmote(chatID int64, replyToMessageID int, emoteID
 	attachment := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(paths.Webm))
 	attachment.ReplyToMessageID = replyToMessageID
 
-	err = h.apis.Bot.SendAttachment(attachment)
+	err = h.apis.TgBot.SendAttachment(attachment)
 	if err != nil {
 		return errors.Wrap(err, errMsg)
 	}
@@ -210,7 +210,7 @@ func (h *Handler) processOverlayedEmote(chatID int64, replyToMessageID int, emot
 	attachment := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(resFilePath))
 	attachment.ReplyToMessageID = replyToMessageID
 
-	err = h.apis.Bot.SendAttachment(attachment)
+	err = h.apis.TgBot.SendAttachment(attachment)
 	if err != nil {
 		return errors.Wrap(err, errMsg)
 	}

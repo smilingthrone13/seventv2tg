@@ -354,7 +354,7 @@ func (c *Converter) getVideoDimensions(inpPath string) (width, height int, err e
 	return probeOutput.Streams[0].Width, probeOutput.Streams[0].Height, nil
 }
 
-func (m *Converter) getVideoFramerate(inpPath string) (int, error) {
+func (c *Converter) getVideoFramerate(inpPath string) (int, error) {
 	const errMessage = "getVideoFramerate"
 
 	cmd := exec.Command("magick", "identify", "-format", "%T\n", inpPath)

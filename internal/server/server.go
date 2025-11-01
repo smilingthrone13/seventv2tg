@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
+	"sync"
 	"syscall"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -13,12 +15,14 @@ import (
 	"seventv2tg/internal/handler"
 )
 
-type botApi interface {
-	GetUpdatesChan() tgbotapi.UpdatesChannel
-	Shutdown()
-}
+const (
+	startCommand       = "start"
+	maintenanceCommand = "maintenance"
 
-type botAPI interface {
+	isInMaintenanceMessage = "Bot is currently in maintenance. Try again later."
+)
+
+type botApi interface {
 	GetUpdatesChan() tgbotapi.UpdatesChannel
 	Shutdown()
 }
@@ -33,6 +37,9 @@ type (
 		cfg      *config.Config
 		api      botApi
 		handlers *handler.Handlers
+
+		isInMaintenance bool
+		mu              sync.RWMutex
 	}
 )
 
@@ -51,6 +58,7 @@ func (s *Server) Start() {
 	updatesChan := s.api.GetUpdatesChan()
 
 	log.Println("Server started!")
+	log.Printf("Start configuration: debug: %t; admins: %v", s.cfg.Debug, s.cfg.AdminIDs)
 
 	for {
 		select {
@@ -70,8 +78,39 @@ func (s *Server) handleUpdate(update *tgbotapi.Update) {
 	}
 
 	if update.Message.IsCommand() {
+		switch update.Message.Command() {
+		case startCommand:
+			s.handlers.General.StartResponse(update.Message.Chat.ID)
+		case maintenanceCommand:
+			if !slices.Contains(s.cfg.AdminIDs, update.Message.From.ID) {
+				return
+			}
+
+			status := s.switchMaintenanceStatus()
+			s.handlers.General.MaintenanceResponse(update.Message.Chat.ID, status)
+			log.Printf("Maintenance status set to %t by user %d\n", status, update.Message.From.ID)
+		}
+
 		return
 	}
 
+	s.mu.RLock()
+	if s.isInMaintenance {
+		s.mu.RUnlock()
+		s.handlers.General.MessageResponse(update.Message.Chat.ID, isInMaintenanceMessage)
+
+		return
+	}
+	s.mu.RUnlock()
+
 	s.handlers.Media.CreateVideoFromEmote(context.Background(), update.Message)
+}
+
+func (s *Server) switchMaintenanceStatus() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.isInMaintenance = !s.isInMaintenance
+
+	return s.isInMaintenance
 }
