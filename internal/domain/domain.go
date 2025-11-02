@@ -11,3 +11,8 @@ type EmotePaths struct {
 	Webp string
 	Webm string
 }
+
+type EmoteLayer struct {
+	WebmPath string
+	Duration float64
+}

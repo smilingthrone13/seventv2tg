@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"seventv2tg/internal/domain"
 	"strconv"
 	"strings"
 
@@ -72,7 +73,7 @@ func (c *Converter) ConvertToVideo(inpFilePath string) (resPath string, err erro
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	framerate, err := c.getVideoFramerate(inpFilePath)
+	framerate, _, err := c.getVideoInfo(inpFilePath)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
@@ -106,7 +107,7 @@ func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err er
 		}
 	}()
 
-	var layers []string
+	var layers []domain.EmoteLayer
 
 	height, width := autoHeight, autoWidth
 
@@ -118,7 +119,7 @@ func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err er
 			return "", errors.Wrap(err, errMsg)
 		}
 
-		framerate, err := c.getVideoFramerate(inpFilePaths[i])
+		framerate, duration, err := c.getVideoInfo(inpFilePaths[i])
 		if err != nil {
 			return "", errors.Wrap(err, errMsg)
 		}
@@ -144,7 +145,10 @@ func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err er
 			}
 		}
 
-		layers = append(layers, webmPath)
+		layers = append(layers, domain.EmoteLayer{
+			WebmPath: webmPath,
+			Duration: duration,
+		})
 	}
 
 	err = c.createOverlayedVideo(layers, resPath)
@@ -266,14 +270,14 @@ func (c *Converter) createVideoFromSequence(inpPath, outPath string, framerate, 
 	}
 }
 
-func (c *Converter) createOverlayedVideo(inpPaths []string, outPath string) error {
+func (c *Converter) createOverlayedVideo(inpLayers []domain.EmoteLayer, outPath string) error {
 	const errMessage = "createOverlayedVideo"
 	var err error
 
 	bitrate := overlayedBitRate
 
 	for {
-		err = c.assembleLayers(inpPaths, outPath, bitrate)
+		err = c.assembleLayers(inpLayers, outPath, bitrate)
 		if err != nil {
 			return errors.Wrap(err, errMessage)
 		}
@@ -340,10 +344,10 @@ func (c *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 	return errors.Wrap(cmd.Run(), errMessage)
 }
 
-func (c *Converter) assembleLayers(inpPaths []string, outPath string, bitrate int) error {
+func (c *Converter) assembleLayers(inpLayers []domain.EmoteLayer, outPath string, bitrate int) error {
 	const errMessage = "assembleLayers"
 
-	if len(inpPaths) < 2 {
+	if len(inpLayers) < 2 {
 		return errors.Wrap(errors.New("not enough videos to merge"), errMessage)
 	}
 
@@ -351,17 +355,26 @@ func (c *Converter) assembleLayers(inpPaths []string, outPath string, bitrate in
 		"-y",
 		"-loglevel", "error",
 		"-c:v", "libvpx-vp9",
-		"-i", inpPaths[0],
 	}
+
+	// Если основа короче, чем оверлей - зацикливаем основу.
+	for i := 1; i < len(inpLayers); i++ {
+		if inpLayers[i].Duration > inpLayers[0].Duration {
+			args = append(args, "-stream_loop", "-1")
+			break
+		}
+	}
+
+	args = append(args, "-i", inpLayers[0].WebmPath)
 
 	overlayString := strings.Builder{}
 	prevLayer := "0"
 
-	for i := 1; i < len(inpPaths); i++ {
+	for i := 1; i < len(inpLayers); i++ {
 		inpArgs := []string{
 			"-stream_loop", "-1",
 			"-c:v", "libvpx-vp9",
-			"-i", inpPaths[i],
+			"-i", inpLayers[i].WebmPath,
 		}
 
 		args = append(args, inpArgs...)
@@ -369,7 +382,7 @@ func (c *Converter) assembleLayers(inpPaths []string, outPath string, bitrate in
 		currLayer := fmt.Sprintf("tmp%d", i)
 
 		overlayString.WriteString(fmt.Sprintf("[%s][%d] overlay=shortest=1", prevLayer, i))
-		if i != len(inpPaths)-1 {
+		if i != len(inpLayers)-1 {
 			overlayString.WriteString(" [" + currLayer + "]; ")
 		}
 
@@ -424,13 +437,13 @@ func (c *Converter) getVideoDimensions(inpPath string) (width, height int, err e
 	return probeOutput.Streams[0].Width, probeOutput.Streams[0].Height, nil
 }
 
-func (c *Converter) getVideoFramerate(inpPath string) (int, error) {
-	const errMessage = "getVideoFramerate"
+func (c *Converter) getVideoInfo(inpPath string) (framerate int, duration float64, err error) {
+	const errMessage = "getVideoInfo"
 
 	cmd := exec.Command("magick", "identify", "-format", "%T\n", inpPath)
 	output, err := cmd.Output()
 	if err != nil {
-		return 0, errors.Wrap(err, errMessage)
+		return 0, 0, errors.Wrap(err, errMessage)
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -438,17 +451,18 @@ func (c *Converter) getVideoFramerate(inpPath string) (int, error) {
 	for _, line := range lines {
 		delay, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil {
-			return 0, errors.Wrap(err, errMessage)
+			return 0, 0, errors.Wrap(err, errMessage)
 		}
 		totalTime += delay
 	}
 
+	duration = float64(totalTime) / 100.0
+
 	if totalTime == 0 || len(lines) == 0 {
-		return 1, nil
+		return 1, 0, nil
 	}
 
-	duration := float64(totalTime) / 100.0
-	fps := float64(len(lines)) / duration
+	framerate = min(defaultFramerate, int(math.Round(float64(len(lines))/duration)))
 
-	return min(defaultFramerate, int(math.Round(fps))), nil
+	return framerate, duration, nil
 }
