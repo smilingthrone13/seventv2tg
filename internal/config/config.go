@@ -15,14 +15,19 @@ const (
 	inputDirName  = "input"
 	jobsDirName   = "jobs"
 	resultDirName = "output"
+
+	mediaWorkerCount      = 3
+	ffmpegRendererThreads = 3
 )
 
 type (
 	Config struct {
-		BotApiKey string  `yaml:"bot_api_key"`
-		Debug     bool    `yaml:"debug"`
-		AdminIDs  []int64 `yaml:"admin_ids"`
-		Paths     Paths
+		BotApiKey             string  `yaml:"bot_api_key"`
+		Debug                 bool    `yaml:"debug"`
+		AdminIDs              []int64 `yaml:"admin_ids"`
+		Paths                 Paths
+		MediaWorkersCount     int `yaml:"media_workers_count"`
+		FfmpegRendererThreads int `yaml:"ffmpeg_renderer_threads"`
 	}
 	Paths struct {
 		Input  string
@@ -40,6 +45,8 @@ func NewConfig(cfgFolderPath string) (*Config, error) {
 			Jobs:   jobsDirName,
 			Result: resultDirName,
 		},
+		MediaWorkersCount:     mediaWorkerCount,
+		FfmpegRendererThreads: ffmpegRendererThreads,
 	}
 
 	envPath := filepath.Join(cfgFolderPath, "app.env")
@@ -66,6 +73,8 @@ func (c *Config) loadEnv(filePath string) error {
 	c.BotApiKey = os.Getenv("bot_api_key")
 	c.Debug, _ = strconv.ParseBool(os.Getenv("debug"))
 	c.AdminIDs = parseAdminIds(os.Getenv("admin_ids"))
+	c.MediaWorkersCount, _ = strconv.Atoi(os.Getenv("media_workers_count"))
+	c.FfmpegRendererThreads, _ = strconv.Atoi(os.Getenv("ffmpeg_renderer_threads"))
 
 	return nil
 }

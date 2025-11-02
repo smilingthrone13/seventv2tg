@@ -11,6 +11,6 @@ type Services struct {
 
 func New(cfg *config.Config) *Services {
 	return &Services{
-		Media: media.NewMediaConverter(cfg.Paths.Jobs, cfg.Paths.Result),
+		Media: media.NewMediaConverter(cfg.Paths.Jobs, cfg.Paths.Result, cfg.FfmpegRendererThreads),
 	}
 }

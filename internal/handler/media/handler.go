@@ -19,7 +19,6 @@ import (
 	"seventv2tg/internal/service"
 )
 
-const workerCount = 3
 const emoteIdLength = 26
 const maxOverlayedEmotes = 3
 
@@ -42,7 +41,7 @@ func New(cfg *config.Config, apis *webapi.WebAPIs, services *service.Services) *
 		activityCache: cache.New(cache.NoExpiration, cache.NoExpiration),
 	}
 
-	for range workerCount {
+	for range cfg.MediaWorkersCount {
 		go h.mediaWorker()
 	}
 

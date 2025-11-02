@@ -58,7 +58,7 @@ func (s *Server) Start() {
 	updatesChan := s.api.GetUpdatesChan()
 
 	log.Println("Server started!")
-	log.Printf("Start configuration: debug: %t; admins: %v", s.cfg.Debug, s.cfg.AdminIDs)
+	//log.Printf("Start configuration: debug: %t; admins: %v", s.cfg.Debug, s.cfg.AdminIDs)
 
 	for {
 		select {

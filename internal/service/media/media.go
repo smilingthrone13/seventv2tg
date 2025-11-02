@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -38,16 +39,18 @@ type (
 	}
 )
 
-func NewMediaConverter(jobsDir, resDir string) *Converter {
+func NewMediaConverter(jobsDir, resDir string, videoRendererThreads int) *Converter {
 	return &Converter{
-		jobsDir: jobsDir,
-		resDir:  resDir,
+		jobsDir:              jobsDir,
+		resDir:               resDir,
+		videoRendererThreads: videoRendererThreads,
 	}
 }
 
 type Converter struct {
-	jobsDir string
-	resDir  string
+	jobsDir              string
+	resDir               string
+	videoRendererThreads int
 }
 
 func (c *Converter) ConvertToVideo(inpFilePath string) (resPath string, err error) {
@@ -74,7 +77,7 @@ func (c *Converter) ConvertToVideo(inpFilePath string) (resPath string, err erro
 		return "", errors.Wrap(err, errMsg)
 	}
 
-	err = c.createSequence(inpFilePath, filepath.Join(framesDirPath, frameMask))
+	err = c.createSequence(inpFilePath, framesDirPath, frameMask)
 	if err != nil {
 		return "", errors.Wrap(err, errMsg)
 	}
@@ -115,18 +118,17 @@ func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err er
 			return "", errors.Wrap(err, errMsg)
 		}
 
-		seqPath := filepath.Join(framesDirPath, frameMask)
-
 		framerate, err := c.getVideoFramerate(inpFilePaths[i])
 		if err != nil {
 			return "", errors.Wrap(err, errMsg)
 		}
 
-		err = c.createSequence(inpFilePaths[i], seqPath)
+		err = c.createSequence(inpFilePaths[i], framesDirPath, frameMask)
 		if err != nil {
 			return "", errors.Wrap(err, errMsg)
 		}
 
+		seqPath := filepath.Join(framesDirPath, frameMask)
 		webmPath := filepath.Join(c.jobsDir, jobID, fmt.Sprintf("layer-%d.webm", i))
 
 		err = c.createVideoFromSequence(seqPath, webmPath, framerate, width, height)
@@ -154,17 +156,86 @@ func (c *Converter) OverlayVideos(inpFilePaths []string) (resPath string, err er
 	return resPath, nil
 }
 
-func (c *Converter) createSequence(inpPath, outPath string) error {
+func (c *Converter) createSequence(inpPath, outPath, frameMask string) error {
+	outSeqPath := filepath.Join(outPath, frameMask)
+
 	cmd := exec.Command(
 		"magick",
 		inpPath,
 		"-coalesce",
 		"+repage",
-		outPath,
+		outSeqPath,
 	)
 	cmd.Stderr = os.Stderr
 
-	return errors.Wrap(cmd.Run(), "createSequence")
+	err := cmd.Run()
+	if err != nil {
+		return errors.Wrap(err, "createSequence")
+	}
+
+	frames, err := os.ReadDir(outPath)
+	if err != nil {
+		return errors.Wrap(err, "createSequence")
+	}
+
+	for i := range frames {
+		filePath := filepath.Join(outPath, frames[i].Name())
+
+		isEmpty, err := c.isEmptyFrame(filePath)
+		if err != nil {
+			return errors.Wrap(err, "createSequence")
+		}
+
+		if !isEmpty {
+			continue
+		}
+
+		err = c.processEmptyFrame(filePath)
+		if err != nil {
+			return errors.Wrap(err, "createSequence")
+		}
+	}
+
+	return nil
+}
+
+func (c *Converter) isEmptyFrame(filepath string) (bool, error) {
+	cmd := exec.Command(
+		"magick",
+		filepath,
+		"-format", "%[fx:mean]",
+		"info:",
+	)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return false, errors.Wrap(err, "getImageMean")
+	}
+
+	meanStr := strings.TrimSpace(out.String())
+	mean, err := strconv.ParseFloat(meanStr, 64)
+	if err != nil {
+		return false, errors.Wrap(err, "getImageMean")
+	}
+
+	return mean == 0, nil
+}
+
+func (c *Converter) processEmptyFrame(filepath string) error {
+	// Костыль. Полностью прозрачные кадры при сборке webm превращаются в черные,
+	// поэтому ставим в углу полупрозрачную точку.
+	cmd := exec.Command(
+		"magick",
+		filepath,
+		"-stroke", "rgba(255,0,0,0.1)",
+		"-strokewidth", "1",
+		"-draw", "point 0,0",
+		filepath,
+	)
+
+	return errors.Wrap(cmd.Run(), "processEmptyFrame")
 }
 
 func (c *Converter) createVideoFromSequence(inpPath, outPath string, framerate, width, height int) error {
@@ -255,13 +326,12 @@ func (c *Converter) assembleSequence(inpPath, outPath string, framerate, bitrate
 		"-loglevel", "error",
 		"-framerate", fmt.Sprintf("%d", framerate),
 		"-i", inpPath,
-		//"-vf", "scale="+scaleStr+",format=yuva420p,loop=0",
 		"-vf", "scale="+scaleStr+",format=yuva420p",
 		"-c:v", "libvpx-vp9",
 		"-b:v", fmt.Sprintf("%dK", bitrate),
 		"-auto-alt-ref", "0",
 		"-an",
-		"-threads", "3", // TODO: в конфиг
+		"-threads", fmt.Sprintf("%d", c.videoRendererThreads),
 		"-t", "3",
 		outPath,
 	)
@@ -315,7 +385,7 @@ func (c *Converter) assembleLayers(inpPaths []string, outPath string, bitrate in
 		"-auto-alt-ref", "0",
 		"-an",
 		"-t", "3",
-		"-threads", "3", // TODO: в конфиг
+		"-threads", fmt.Sprintf("%d", c.videoRendererThreads),
 		outPath,
 	)
 
@@ -380,5 +450,5 @@ func (c *Converter) getVideoFramerate(inpPath string) (int, error) {
 	duration := float64(totalTime) / 100.0
 	fps := float64(len(lines)) / duration
 
-	return min(defaultFramerate, max(int(math.Round(fps)), 10)), nil
+	return min(defaultFramerate, int(math.Round(fps))), nil
 }
