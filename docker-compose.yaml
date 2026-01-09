@@ -1,0 +1,9 @@
+services:
+  bot:
+    container_name: 7tv2tg_bot
+    image: smilingthrone13/7tv2tg_bot:latest
+    volumes:
+      - ./config:/app/config
+#      - ./jobs:/app/jobs
+#      - ./output:/app/output
+    restart: unless-stopped
